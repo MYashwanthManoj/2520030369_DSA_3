@@ -2,6 +2,11 @@ package engine;
 
 import util.Trace;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 /**
  * STAGE 3 OF THE PIPELINE  ->  keyword rules (no algorithm, just routing)
  *
@@ -12,8 +17,10 @@ import util.Trace;
 public class IntentDetector {
 
     public enum Intent {
-        FERTILIZER_BUDGET,      // -> Knapsack
-        CROP_FERTILIZER_MATCH,  // -> Bipartite Matching
+        FERTILIZER_BUDGET,      // -> Knapsack + greedy 1/2-approximation
+        CROP_FERTILIZER_MATCH,  // -> Bipartite Matching + Bitmask DP
+        FIELD_SUPPLY,           // -> Max Flow / Min Cut
+        FERTILIZER_COVER,       // -> Greedy Set Cover
         CROP_COMPARE,           // -> side by side crop table
         CROP_PLANNER,           // -> rainfall / temperature / water filter
         DISEASE_DIAGNOSIS,      // -> KMP over symptom and damage lists
@@ -38,9 +45,23 @@ public class IntentDetector {
         boolean saysFert   = hasAny(q, "fertilizer", "fertiliser", "manure", "nutrient")
                              || !e.fertilizers.isEmpty();
 
+        // 0. several fields of each crop against the shop's stock  ->  Max Flow
+        if (!e.crops.isEmpty() && !hasMoney
+                && (hasAny(q, "field", "acre", "plot", "supply", "stock", "bags", "hectare")
+                    || q.matches(".*\\bf(ie|ei|i|e)l?e?d?s?\\b.*"))   // "fileds", "feilds", "filds"
+                && !fieldCounts(q, e.crops).isEmpty()) {
+            return Intent.FIELD_SUPPLY;
+        }
+
         // 1. budget question  ->  Knapsack
         if (hasMoney && hasNumber && (saysFert || !e.crops.isEmpty())) {
             return Intent.FERTILIZER_BUDGET;
+        }
+
+        // 1b. one shopping list for the whole farm  ->  Greedy Set Cover
+        if (e.crops.size() >= 2 && hasAny(q, "cover", "fewest", "minimum", "least",
+                "smallest", "all my crops", "every crop", "single list", "one list")) {
+            return Intent.FERTILIZER_COVER;
         }
 
         // 2. assign fertilizers to several crops  ->  Bipartite Matching
@@ -104,6 +125,42 @@ public class IntentDetector {
     private static boolean hasAny(String text, String... words) {
         for (String w : words) if (text.contains(w)) return true;
         return false;
+    }
+
+    /** Largest field count we accept; anything bigger is a typo, not a farm. */
+    public static final int MAX_FIELDS = 100_000;
+
+    /**
+     * "3 fields of rice and 2 acres of cotton"  ->  [rice=3, cotton=2].
+     * A crop named without a number in front of it counts as one field.
+     * The unit word between the number and the crop may be anything
+     * ("fields", "acres", a typo like "fileds") or missing ("2 of cotton").
+     */
+    public static List<String[]> fieldCounts(String query, java.util.Set<String> crops) {
+        List<String[]> out = new ArrayList<>();
+        String q = query.toLowerCase();
+        boolean anyNumber = false;
+        for (String crop : crops) {
+            // "3 fields of rice" / "3 fileds rice" / "3 of rice" / "3 rice"
+            Matcher m = Pattern.compile("(\\d+)\\s*(?:[a-z]+\\s+)?(?:of\\s+)?"
+                    + Pattern.quote(crop) + "\\b").matcher(q);
+            int n = 1;
+            if (m.find()) { n = clampFields(m.group(1)); anyNumber = true; }
+            else {
+                // "rice 3 fields" / "rice x3"
+                Matcher m2 = Pattern.compile("\\b" + Pattern.quote(crop)
+                        + "\\s*(?:x|\\*)?\\s*(\\d+)\\s*(?:[a-z]+)?").matcher(q);
+                if (m2.find()) { n = clampFields(m2.group(1)); anyNumber = true; }
+            }
+            if (n > 0) out.add(new String[]{crop, String.valueOf(n)});
+        }
+        return anyNumber ? out : new ArrayList<>();
+    }
+
+    /** Parse a digit string without overflowing; huge values are capped. */
+    private static int clampFields(String digits) {
+        try { return Math.min(Integer.parseInt(digits), MAX_FIELDS); }
+        catch (NumberFormatException tooBig) { return MAX_FIELDS; }
     }
 
     /** Pull the budget number out of a sentence like "under 3000 rupees". */

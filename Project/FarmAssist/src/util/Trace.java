@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Prints a one line note every time one of the eight algorithms runs.
+ * Prints a one line note every time one of the thirteen algorithms runs.
  * This is what makes the algorithm usage VISIBLE during the demo.
  * Turn it off from the chat with the command:  trace off
  *
@@ -18,7 +18,7 @@ import java.util.List;
  */
 public class Trace {
 
-    public static boolean enabled = true;
+    public static boolean enabled = false;
 
     /** Set to false by the "color off" command through Theme. */
     public static boolean colours = true;

@@ -27,14 +27,20 @@ public class DataLoader {
     public List<String[]> smallTalk = new ArrayList<>();   // {triggers, response}
 
     public void loadAll(String dataFolder) {
-        loadCrops(dataFolder + "/crops.csv");
-        loadDiseases(dataFolder + "/diseases.csv");
-        loadFertilizers(dataFolder + "/fertilizers.csv");
-        loadArticles(dataFolder + "/articles.csv");
-        loadPests(dataFolder + "/pests.csv");
-        loadSymptoms(dataFolder + "/symptoms.csv");
-        synonyms = readRows(dataFolder + "/synonyms.csv", 2);
-        smallTalk = readRows(dataFolder + "/smalltalk.csv", 2);
+        loadCrops(resolvePath(dataFolder, "crops"));
+        loadDiseases(resolvePath(dataFolder, "diseases"));
+        loadFertilizers(resolvePath(dataFolder, "fertilizers"));
+        loadArticles(resolvePath(dataFolder, "articles"));
+        loadPests(resolvePath(dataFolder, "pests"));
+        loadSymptoms(resolvePath(dataFolder, "symptoms"));
+        synonyms = readRows(resolvePath(dataFolder, "synonyms"), 2);
+        smallTalk = readRows(resolvePath(dataFolder, "smalltalk"), 2);
+    }
+
+    private String resolvePath(String dataFolder, String baseName) {
+        java.io.File txtFile = new java.io.File(dataFolder, baseName + ".txt");
+        if (txtFile.exists()) return txtFile.getPath();
+        return dataFolder + "/" + baseName + ".csv";
     }
 
     // ------------------------------------------------------------------ files
@@ -78,6 +84,8 @@ public class DataLoader {
             x.cost = toInt(f[4]);
             x.suited = splitList(f[5]);
             x.benefit = toInt(f[6]);
+            // optional 8th column: bags in stock at the shop (for the supply planner)
+            x.stock = f.length > 7 && !f[7].trim().isEmpty() ? toInt(f[7]) : Fertilizer.DEFAULT_STOCK;
             fertilizers.add(x);
         }
     }
@@ -188,6 +196,8 @@ public class DataLoader {
             "recommend", "which", "what", "when", "where", "how", "grow", "growing",
             "cultivation", "season", "soil", "water", "irrigation", "spray", "control",
             "crop", "crops", "leaf", "leaves", "plant", "plants", "field", "yield",
+            "fields", "fertilizers", "fertilisers", "acre", "acres", "plot", "plots",
+            "supply", "stock", "bags", "fewest", "cover", "covers", "minimum",
             "manure", "compost", "organic", "nitrogen", "phosphorus", "potassium",
             "about", "info", "information", "care", "give", "need", "help", "problem",
             "attack", "infected", "damage", "related", "article", "articles", "match",

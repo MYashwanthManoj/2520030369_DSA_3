@@ -1,5 +1,6 @@
 package ui;
 
+import engine.AutocompleteEngine;
 import engine.DataLoader;
 import engine.Diagnoser;
 import engine.EntityExtractor;
@@ -11,6 +12,7 @@ import engine.SearchResult;
 import engine.SmallTalk;
 import engine.SpellCorrector;
 import engine.SynonymMapper;
+import engine.WeatherService;
 import model.Crop;
 import model.Fertilizer;
 import model.Pest;
@@ -18,7 +20,6 @@ import util.Trace;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Scanner;
 import java.util.Set;
 
 /**
@@ -35,8 +36,11 @@ import java.util.Set;
  *     |--> 2. Aho-Corasick       : detect crops / diseases / fertilizers / symptoms
  *     |--> 3. Intent routing     : decide which feature answers
  *     |
- *     +--> FERTILIZER_BUDGET     : 6. Knapsack
- *     +--> CROP_FERTILIZER_MATCH : 7. Bipartite Matching
+ *     +--> FERTILIZER_BUDGET     : 6. Knapsack + 12. Greedy Knapsack (1/2-approx)
+ *     +--> CROP_FERTILIZER_MATCH : 7. Bipartite Matching + 9. Bitmask DP
+ *     +--> FIELD_SUPPLY          : 10. Max Flow / Min Cut
+ *     +--> FERTILIZER_COVER      : 11. Greedy Set Cover
+ *     +--> CROP_PLANNER          : 13. Parallel map + reduce
  *     +--> DISEASE_DIAGNOSIS     : 1. KMP  + 8. QuickSort
  *     +--> CROP / FERT INFO      : direct record lookup
  *     +--> GENERAL_SEARCH        : 2. Rabin-Karp + 1. KMP + 8. QuickSort
@@ -64,6 +68,10 @@ public class ConsoleChat {
     private Diagnoser diagnoser;
     private Recommender recommender;
     private Planner planner;
+    private AutocompleteEngine autocompleteEngine;
+    private WeatherService weather;
+
+    private List<String> currentSuggestions = new ArrayList<>();
 
     public static void main(String[] args) {
         String dataFolder = (args.length > 0) ? args[0] : "data";
@@ -77,9 +85,6 @@ public class ConsoleChat {
         System.out.println();
         System.out.println(Theme.banner());
 
-        System.out.println();
-        System.out.println(PAD + Theme.stone("loading the knowledge base ..."));
-
         data = new DataLoader();
         data.loadAll(dataFolder);
         if (data.articles.isEmpty()) {
@@ -90,26 +95,36 @@ public class ConsoleChat {
             return;
         }
 
-        smallTalk       = new SmallTalk(data);
-        synonymMapper   = new SynonymMapper(data);
-        spellCorrector  = new SpellCorrector(data, smallTalk.triggerWords());
-        entityExtractor = new EntityExtractor(data);
-        intentDetector  = new IntentDetector();
-        searchEngine    = new SearchEngine(data);
-        diagnoser       = new Diagnoser(data);
-        recommender     = new Recommender(data);
-        planner         = new Planner(data);
+        smallTalk          = new SmallTalk(data);
+        synonymMapper      = new SynonymMapper(data);
+        spellCorrector     = new SpellCorrector(data, smallTalk.triggerWords());
+        entityExtractor    = new EntityExtractor(data);
+        intentDetector     = new IntentDetector();
+        searchEngine       = new SearchEngine(data);
+        diagnoser          = new Diagnoser(data);
+        recommender        = new Recommender(data);
+        planner            = new Planner(data);
+        autocompleteEngine = new AutocompleteEngine(data);
+        weather            = new WeatherService(dataFolder);
 
-        printKnowledgeBase();
-        help();
+        System.out.println(PAD + Theme.stone("type ") + Theme.crop("help") + Theme.stone(" for examples and commands."));
 
-        Scanner sc = new Scanner(System.in);
+        LiveInput input = new LiveInput(q -> autocompleteEngine.complete(q, 6));
         while (true) {
             blankLine();
-            System.out.print(Theme.prompt());
-            if (!sc.hasNextLine()) break;
-            String line = sc.nextLine().trim();
+            String line = input.readLine();
+            if (line == null) break;
             if (line.isEmpty()) continue;
+
+            if (line.matches("\\d+") && !currentSuggestions.isEmpty()) {
+                int index = Integer.parseInt(line) - 1;
+                if (index >= 0 && index < currentSuggestions.size()) {
+                    String selected = currentSuggestions.get(index);
+                    System.out.println();
+                    say("Selected [" + line + "]: " + Theme.sun("\"" + selected + "\""));
+                    line = selected;
+                }
+            }
 
             if (isCommand(line)) {
                 if (line.equalsIgnoreCase("exit") || line.equalsIgnoreCase("quit")) {
@@ -122,7 +137,7 @@ public class ConsoleChat {
             }
             answer(line);
         }
-        sc.close();
+        input.close();
     }
 
     /** The "what is loaded" summary printed at start up. */
@@ -159,7 +174,31 @@ public class ConsoleChat {
 
         // ---- STAGE 0 : EVERYDAY CONVERSATION ----------------------------
         String chat = smallTalk.reply(rawQuery);
-        if (chat != null) { System.out.println(); say(chat); return; }
+        if (chat != null) {
+            System.out.println();
+            say(chat);
+            return;
+        }
+
+        // ---- STAGE 0.2 : LIVE WEATHER -----------------------------------
+        // before spell correction, because a town name is not in the
+        // dictionary and would be "corrected" into a crop.
+        if (isWeatherQuestion(rawQuery)) {
+            showWeather(extractCity(rawQuery));
+            return;
+        }
+
+        // ---- STAGE 0.5 : TRIE NEXT-WORD PREDICTION ----------------------
+        String[] phraseWords = rawQuery.trim().split("\\s+");
+        if (phraseWords.length == 1 && autocompleteEngine != null) {
+            List<String> predicted = autocompleteEngine.predict(rawQuery, 5);
+            if (!predicted.isEmpty()) {
+                System.out.println();
+                say("Next-word predictions for \"" + Theme.sun(rawQuery) + "\":");
+                showSuggestions(predicted);
+                return;
+            }
+        }
 
         // ---- STAGE 1 : EDIT DISTANCE + WORD SPLITTER --------------------
         SpellCorrector.Result sp = spellCorrector.correct(rawQuery);
@@ -193,6 +232,8 @@ public class ConsoleChat {
         switch (intent) {
             case FERTILIZER_BUDGET:     answerBudget(query, entities);      break;
             case CROP_FERTILIZER_MATCH: answerMatching(entities);           break;
+            case FIELD_SUPPLY:          answerSupply(query, entities);      break;
+            case FERTILIZER_COVER:      answerCover(entities);              break;
             case CROP_COMPARE:          answerCompare(entities);            break;
             case CROP_PLANNER:          answerPlanner(query, entities);     break;
             case DISEASE_DIAGNOSIS:     answerDiagnosis(query, entities);   break;
@@ -247,6 +288,20 @@ public class ConsoleChat {
         System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
                 "chosen by 0/1 Knapsack, the highest total benefit that fits the budget",
                 Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
+
+        // the NP-hard angle: what the greedy 1/2-approximation would have bought
+        StringBuilder g = new StringBuilder();
+        for (Fertilizer f : plan.greedyChosen) {
+            if (g.length() > 0) g.append(", ");
+            g.append(f.name);
+        }
+        String verdict = plan.greedyBenefit == plan.totalBenefit ? "matches the exact answer"
+                : "benefit " + plan.greedyBenefit + " vs " + plan.totalBenefit + " exact, within the proven 1/2 bound";
+        System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
+                "greedy 1/2-approximation (value per rupee) picks " + g + " for Rs "
+                + plan.greedyCost + " - " + verdict + ". Knapsack is NP-hard; the DP is "
+                + "pseudo-polynomial in the budget, the greedy is O(n log n).",
+                Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
     }
 
     private int cheapest(List<Fertilizer> list) {
@@ -267,24 +322,146 @@ public class ConsoleChat {
         Theme.Table t = Theme.Table.of(Theme.I_LINK, "field by field plan")
                 .col("crop",       20, false, Theme::chalk)
                 .col("fertilizer",  0, false, Theme::crop)
-                .col("npk",        10, false, Theme::stone);
+                .col("npk",        10, false, Theme::stone)
+                .col("benefit",     9, true,  Theme::leaf);
 
         for (int i = 0; i < plan.crops.size(); i++) {
             int f = plan.assignment[i];
             if (f >= 0) {
                 Fertilizer fert = plan.pool.get(f);
                 t.row(Theme.title(plan.crops.get(i)), Theme.title(fert.name),
-                      fert.n + "-" + fert.p + "-" + fert.k);
+                      fert.n + "-" + fert.p + "-" + fert.k, fert.benefit + "/100");
             } else {
-                t.row(Theme.title(plan.crops.get(i)), "no free suitable bag", "");
+                t.row(Theme.title(plan.crops.get(i)), "no free suitable bag", "", "");
             }
         }
+        if (plan.optimised) t.total("TOTAL", "", "", String.valueOf(plan.totalBenefit));
         t.print();
 
         System.out.println();
         System.out.println(PAD + Theme.leaf(Theme.I_OK) + "  "
                 + Theme.chalk("served " + plan.matchedCount + " of " + plan.crops.size() + " fields")
                 + Theme.stone("   " + Theme.I_DOT + "  maximum bipartite matching"));
+        if (plan.optimised) {
+            System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
+                    "bags chosen by bitmask DP over the 2^" + plan.crops.size()
+                    + " subsets of fields: the highest total benefit among all maximum matchings",
+                    Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
+        }
+        System.out.println(PAD + Theme.stone("several fields of a crop?  try ")
+                + Theme.sun("\"supply 3 fields of rice and 2 fields of cotton\""));
+    }
+
+    // ------------- FEATURE : many fields  ->  MAX FLOW / MIN CUT ----------
+
+    private void answerSupply(String query, EntityExtractor.Entities e) {
+        List<String> crops = new ArrayList<>();
+        List<Integer> fields = new ArrayList<>();
+        for (String[] pair : IntentDetector.fieldCounts(query, e.crops)) {
+            crops.add(pair[0]);
+            fields.add(Integer.parseInt(pair[1]));
+        }
+        Recommender.SupplyPlan plan = recommender.supplyFields(crops, fields);
+
+        say("Bags from the shelf to your " + Theme.sun(plan.totalFields + " fields")
+            + ", one bag per field:");
+        System.out.println();
+
+        Theme.Table t = Theme.Table.of(Theme.I_LINK, "supply plan")
+                .col("crop",        0, false, Theme::chalk)
+                .col("fields",     10, true,  Theme::stone)
+                .col("served",     10, true,  Theme::leaf)
+                .col("short",      10, true,  Theme::alert);
+        for (int i = 0; i < plan.crops.size(); i++) {
+            int missing = plan.fields.get(i) - plan.supplied[i];
+            t.row(Theme.title(plan.crops.get(i)), String.valueOf(plan.fields.get(i)),
+                  String.valueOf(plan.supplied[i]), missing == 0 ? "-" : String.valueOf(missing));
+        }
+        t.total("TOTAL", String.valueOf(plan.totalFields), String.valueOf(plan.totalSupplied),
+                plan.totalFields == plan.totalSupplied ? "-"
+                        : String.valueOf(plan.totalFields - plan.totalSupplied));
+        t.print();
+
+        // which bags go where, one wrapped line per crop
+        System.out.println();
+        for (int i = 0; i < plan.crops.size(); i++) {
+            StringBuilder sent = new StringBuilder();
+            for (int j = 0; j < plan.pool.size(); j++) {
+                if (plan.bags[i][j] == 0) continue;
+                if (sent.length() > 0) sent.append(", ");
+                sent.append(plan.bags[i][j]).append(" ").append(plan.pool.get(j).name);
+            }
+            String indent = PAD + " ".repeat(LABEL_W + 2);
+            System.out.println(PAD + Theme.stone(Theme.padRight(plan.crops.get(i), LABEL_W)) + "  "
+                    + Theme.crop(Theme.wrap(sent.length() == 0 ? "nothing suitable in stock"
+                            : sent.toString(), Theme.WIDTH - indent.length() - 1, indent)));
+        }
+
+        System.out.println();
+        if (plan.totalSupplied == plan.totalFields) {
+            System.out.println(PAD + Theme.leaf(Theme.I_OK) + "  "
+                    + Theme.chalk("every field gets a bag")
+                    + Theme.stone("   " + Theme.I_DOT + "  maximum flow = " + plan.totalSupplied));
+        } else {
+            System.out.println(PAD + Theme.alert(Theme.I_WARN) + "  "
+                    + Theme.chalk((plan.totalFields - plan.totalSupplied) + " field(s) go without")
+                    + Theme.stone("   " + Theme.I_DOT + "  maximum flow = " + plan.totalSupplied));
+            System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
+                    "min cut: " + String.join(", ", plan.shortCrops) + " sit on the source side; "
+                    + "the " + plan.soldOut.size() + " shelves they can reach ("
+                    + shortList(plan.soldOut, 6) + ") hold exactly " + plan.totalSupplied
+                    + " bag(s) between them - "
+                    + "that is the bottleneck, and no assignment can beat it",
+                    Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
+        }
+        System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
+                "source -> crop (fields) -> fertilizer -> sink (bags in stock), "
+                + "solved by Edmonds-Karp; each shop stocks " + Fertilizer.DEFAULT_STOCK
+                + " bags unless data/fertilizers.txt says otherwise",
+                Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
+    }
+
+    /** "a, b, c and 5 more" once a list gets long. */
+    private static String shortList(List<String> items, int max) {
+        if (items.size() <= max) return String.join(", ", items);
+        return String.join(", ", items.subList(0, max)) + " and " + (items.size() - max) + " more";
+    }
+
+    // ------------- FEATURE : one list for the farm  ->  GREEDY SET COVER --
+
+    private void answerCover(EntityExtractor.Entities e) {
+        List<String> crops = new ArrayList<>(e.crops);
+        Recommender.CoverPlan plan = recommender.coverCrops(crops);
+
+        say("The fewest products that between them suit "
+            + Theme.sun(String.join(", ", crops)) + ":");
+        System.out.println();
+
+        Theme.Table t = Theme.Table.of(Theme.I_FERT, "one shopping list")
+                .col("#",           3, true,  Theme::stone)
+                .col("fertilizer", 22, false, Theme::crop)
+                .col("newly covers", 0, false, Theme::chalk);
+        for (int i = 0; i < plan.chosen.size(); i++) {
+            t.row(String.valueOf(i + 1), Theme.title(plan.chosen.get(i).name),
+                  String.join(", ", plan.coversCrops.get(i)));
+        }
+        t.print();
+
+        System.out.println();
+        if (plan.uncovered.isEmpty()) {
+            System.out.println(PAD + Theme.leaf(Theme.I_OK) + "  "
+                    + Theme.chalk(plan.chosen.size() + " product(s) cover all "
+                            + crops.size() + " crops"));
+        } else {
+            System.out.println(PAD + Theme.alert(Theme.I_WARN) + "  "
+                    + Theme.chalk("no crop-specific product suits: " + String.join(", ", plan.uncovered)));
+        }
+        System.out.println(PAD + Theme.ash(Theme.I_DOT + "  ") + Theme.stone(Theme.wrap(
+                "set cover is NP-hard (vertex cover reduces to it), so this is the greedy "
+                + "approximation: always take the product that covers the most crops still "
+                + "uncovered. It uses at most H(" + crops.size() + ") = "
+                + String.format("%.2f", plan.bound) + " times the optimum number of products.",
+                Theme.WIDTH - PAD.length() - 4, PAD + "   ")));
     }
 
     // ----------------- FEATURE : diagnosis  ->  KMP ----------------------
@@ -707,6 +884,13 @@ public class ConsoleChat {
 
         if (c.equals("help")) { help(); return true; }
 
+        if (c.startsWith("city ") && c.length() > 5) {
+            weather.setDefaultCity(line.substring(5).trim());
+            System.out.println();
+            say("I will use " + Theme.sun(Theme.title(weather.defaultCity())) + " for weather from now on.");
+            return true;
+        }
+
         if (c.equals("clear") || c.equals("cls")) {
             Theme.clear();
             System.out.println();
@@ -810,36 +994,29 @@ public class ConsoleChat {
 
     private void help() {
         System.out.println();
-        System.out.println(Theme.section("just talking"));
-        System.out.println();
-        System.out.println(PAD + Theme.sun("hi") + Theme.ash("   " + Theme.I_DOT + "   ")
-                + Theme.sun("how are you") + Theme.ash("   " + Theme.I_DOT + "   ")
-                + Theme.sun("what can you do") + Theme.ash("   " + Theme.I_DOT + "   ")
-                + Theme.sun("thanks"));
-
-        System.out.println();
         System.out.println(Theme.section("in the field"));
         System.out.println();
         example(Theme.I_CROP,    "how to grow rice",            "full crop profile");
-        example(Theme.I_CROP,    "paddy",                       "local and Hindi names work too");
         example(Theme.I_CROP,    "compare rice and wheat",      "side by side facts");
         example(Theme.I_DISEASE, "my tomato has yellow leaves", "disease diagnosis");
         example(Theme.I_WARN,    "my brinjal has a pest",       "what attacks this crop");
         example(Theme.I_WARN,    "how to control whitefly",     "pest profile");
-        example(Theme.I_DISEASE, "lateblight",                  "joined words are split");
-        example(Theme.I_LENS,    "bhindi me yellow vein",       "mixed language");
 
         System.out.println();
         System.out.println(Theme.section("planning"));
         System.out.println();
         example(Theme.I_CROP, "which crops suit low rainfall", "area planner");
         example(Theme.I_CROP, "crops for a hot climate",       "rainfall and temperature");
+        example(Theme.I_WAVE, "weather in guntur",              "live weather and 5 day outlook");
+        example(Theme.I_WAVE, "will it rain tomorrow",          "your town (set it with: city guntur)");
 
         System.out.println();
         System.out.println(Theme.section("at the shop"));
         System.out.println();
         example(Theme.I_FERT, "suggest fertilizer for tomato under 3000", "best basket in budget");
         example(Theme.I_LINK, "match fertilizers for rice cotton banana", "one bag per crop");
+        example(Theme.I_LINK, "supply 3 fields of rice and 2 of cotton",  "many fields, limited stock");
+        example(Theme.I_FERT, "fewest fertilizers for rice wheat cotton",  "one list for the farm");
         example(Theme.I_FERT, "what is dap",                             "fertilizer profile");
 
         System.out.println();
@@ -848,10 +1025,7 @@ public class ConsoleChat {
         command("list crops | list fertilizers", "everything in the data files");
         command("list diseases | list pests | list articles", "");
         command("trace on | trace off",          "show the algorithm trace");
-        command("algo demo",                     "run all 8 algorithms on tiny inputs");
-        command("color on | basic | off",        "if your terminal shows odd symbols");
-        command("ascii on | ascii off",          "plain borders instead of box drawing");
-        command("width 120 | center off",        "move the page inside the window");
+        command("algo demo",                     "run all 13 algorithms on tiny inputs");
         command("clear | help | exit",           "");
     }
 
@@ -862,6 +1036,133 @@ public class ConsoleChat {
 
     private void command(String c, String what) {
         System.out.println(PAD + Theme.crop(Theme.padRight(c, 40)) + Theme.stone(what));
+    }
+
+    // ====================================================================
+    // LIVE WEATHER
+    // ====================================================================
+
+    private static final String[] WEATHER_WORDS = {
+        "weather", "forecast", "mausam", "will it rain", "rain today", "rain tomorrow",
+        "raining", "temperature today", "temperature in", "temperature at", "humidity",
+        "how hot", "how cold", "climate in", "climate at", "outlook"
+    };
+
+    private boolean isWeatherQuestion(String q) {
+        String c = q.toLowerCase();
+        for (String w : WEATHER_WORDS) if (c.contains(w)) return true;
+        return false;
+    }
+
+    /** "weather in guntur" -> "guntur"; nothing named -> the default town. */
+    private String extractCity(String q) {
+        String c = q.toLowerCase().replaceAll("[?.!,]", " ").trim();
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\b(?:in|at|for|of|near)\\s+([a-z][a-z .'-]*)$").matcher(c);
+        if (m.find()) {
+            String city = m.group(1).trim()
+                    .replaceAll("\\b(today|tomorrow|now|this week|please)\\b", "").trim();
+            if (!city.isEmpty()) return city;
+        }
+        return weather.defaultCity();
+    }
+
+    private void showWeather(String city) {
+        WeatherService.Report r;
+        try {
+            r = weather.lookup(city);
+        } catch (Exception e) {
+            System.out.println();
+            say("I could not fetch the weather: " + e.getMessage());
+            return;
+        }
+
+        String where = r.city + (r.country.isEmpty() ? "" : ", " + r.country);
+        System.out.println();
+        say("Live weather for " + Theme.sun(where) + ":");
+        System.out.println();
+
+        System.out.println(Theme.panelTop(Theme.I_WAVE, "right now"));
+        System.out.println(Theme.panelRow(""));
+        System.out.println(Theme.panelRow(PAD + Theme.bold(Theme.chalk(String.format("%.0f", r.temp) + " C"))
+                + Theme.stone("  feels like " + String.format("%.0f", r.feelsLike) + " C")
+                + Theme.stone("   " + Theme.I_DOT + "   ") + Theme.leaf(r.condition)));
+        System.out.println(Theme.panelRow(PAD
+                + Theme.stone("humidity ") + Theme.water((int) r.humidity + "%")
+                + Theme.stone("     wind ") + Theme.water(String.format("%.0f km/h", r.windMs * 3.6))
+                + Theme.stone("     cloud ") + Theme.water(r.cloudPct + "%")
+                + (r.rainMm > 0 ? Theme.stone("     rain ") + Theme.water(String.format("%.1f mm/h", r.rainMm)) : "")));
+        System.out.println(Theme.panelRow(""));
+        System.out.println(Theme.panelBottom());
+
+        if (!r.days.isEmpty()) {
+            System.out.println();
+            Theme.Table t = Theme.Table.of(Theme.I_CAL, "next five days")
+                    .col("day",    8, false, Theme::chalk)
+                    .col("sky",    0, false, Theme::stone)
+                    .col("low",    6, true,  Theme::water)
+                    .col("high",   6, true,  Theme::sun)
+                    .col("rain",   6, true,  Theme::water)
+                    .col("chance", 7, true,  Theme::stone);
+            for (WeatherService.Day d : r.days) {
+                t.row(d.name, d.condition,
+                      String.format("%.0f C", d.min), String.format("%.0f C", d.max),
+                      d.rainMm > 0 ? String.format("%.0f mm", d.rainMm) : "-",
+                      d.rainChance > 0 ? String.format("%.0f%%", d.rainChance) : "-");
+            }
+            t.print();
+        }
+
+        weatherAdvice(r);
+    }
+
+    /** Turn the readings into a few field decisions. */
+    private void weatherAdvice(WeatherService.Report r) {
+        List<String> tips = new ArrayList<>();
+        WeatherService.Day today    = r.days.isEmpty()   ? null : r.days.get(0);
+        WeatherService.Day tomorrow = r.days.size() > 1  ? r.days.get(1) : null;
+        double rainSoon = Math.max(today == null ? 0 : today.rainChance,
+                                   tomorrow == null ? 0 : tomorrow.rainChance);
+
+        if (r.rainMm > 0 || rainSoon >= 60)
+            tips.add("rain is likely - hold irrigation and do not spray, it will wash off");
+        else if (rainSoon >= 30)
+            tips.add("some chance of rain - spray early morning so it dries before any shower");
+        else if (r.temp >= 32)
+            tips.add("dry and hot - irrigate in the evening to cut evaporation loss");
+
+        if (r.windMs * 3.6 >= 20)
+            tips.add("wind is strong - pesticide drift will be high, postpone spraying");
+        if (r.humidity >= 80 && r.temp >= 20)
+            tips.add("warm and humid - fungal diseases spread fast, inspect leaves for blight and mildew");
+        if (r.temp >= 38)
+            tips.add("heat stress - give a light mulch and avoid transplanting today");
+        if (r.temp <= 8)
+            tips.add("cold - protect seedlings, frost damage possible at night");
+
+        double weekRain = 0;
+        for (WeatherService.Day d : r.days) weekRain += d.rainMm;
+        if (weekRain >= 40)
+            tips.add(String.format("about %.0f mm expected this week - good time for sowing rainfed crops", weekRain));
+
+        if (!tips.isEmpty()) {
+            System.out.println();
+            System.out.println(PAD + Theme.crop("for your field"));
+            for (String tip : tips)
+                System.out.println(PAD + Theme.leaf(Theme.I_ARROW) + "  " + Theme.chalk(tip));
+        }
+
+        Planner.Plan plan = planner.planFor("temperature " + Math.round(r.temp) + " c");
+        if (!plan.crops.isEmpty()) {
+            StringBuilder names = new StringBuilder();
+            for (int i = 0; i < Math.min(5, plan.crops.size()); i++) {
+                if (names.length() > 0) names.append(", ");
+                names.append(plan.crops.get(i).name);
+            }
+            System.out.println();
+            System.out.println(PAD + Theme.stone("crops that like " + Math.round(r.temp) + " C: ")
+                    + Theme.sun(names.toString()));
+        }
     }
 
     // ====================================================================
@@ -900,5 +1201,16 @@ public class ConsoleChat {
     private static String trim(String s, int max) {
         s = s.replace('\n', ' ');
         return s.length() <= max ? s : s.substring(0, max) + Theme.ELLIPSIS;
+    }
+
+    private void showSuggestions(List<String> list) {
+        if (list == null || list.isEmpty()) return;
+        this.currentSuggestions = new ArrayList<>(list);
+        System.out.println();
+        System.out.println(Theme.section("suggested queries (type number to run)"));
+        System.out.println();
+        for (int i = 0; i < list.size(); i++) {
+            System.out.println(PAD + Theme.sun("[" + (i + 1) + "] ") + Theme.chalk(list.get(i)));
+        }
     }
 }
